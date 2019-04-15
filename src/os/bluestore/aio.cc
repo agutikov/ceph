@@ -19,14 +19,14 @@ int aio_queue_t::submit_batch(aio_iter begin, aio_iter end,
 			      uint16_t aios_size, void *priv, 
 			      int *retries)
 {
-  // 2^16 * 125us = ~8 seconds, so max sleep is ~16 seconds
-  int attempts = 16;
+  // 2^19 * 125us = ~64 seconds, so max sleep is ~128 seconds
+  int attempts = 19;
   int delay = 125;
   int r;
 
   aio_iter cur = begin;
   struct aio_t *piocb[aios_size];
-  int left = 0;
+  size_t left = 0;
   while (cur != end) {
     cur->priv = priv;
     *(piocb+left) = &(*cur);
@@ -63,9 +63,16 @@ int aio_queue_t::submit_batch(aio_iter begin, aio_iter end,
       return r;
     }
     ceph_assert(r > 0);
+
+    // first store timestamp, then synchronized increment in_flight counter
+    if (ops_in_flight.load(std::memory_order_relaxed) == 0) {
+      last_op_timestamp = ops_clock_t::now();
+    }
+    ops_in_flight.fetch_add(r, std::memory_order_acq_rel);
+
     done += r;
     left -= r;
-    attempts = 16;
+    attempts = 19;
     delay = 125;
   }
   return done;
@@ -93,6 +100,11 @@ int aio_queue_t::get_next_completed(int timeout_ms, aio_t **paio, int max)
       r = -errno;
 #endif
   } while (r == -EINTR);
+
+  if (r > 0) {
+    ops_in_flight.fetch_sub(r, std::memory_order_relaxed);
+    last_op_timestamp = ops_clock_t::now();
+  }
 
   for (int i=0; i<r; ++i) {
 #if defined(HAVE_LIBAIO)

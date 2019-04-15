@@ -514,6 +514,9 @@ public:
   /// sync any uncommitted state to disk
   void sync_metadata(bool avoid_compact);
 
+  bool is_bdev_healthy() const;
+  std::map<void*, std::pair<std::list<std::string>, std::shared_ptr<BlockDevice::stats_t>>> get_bdev_stats() const;
+
   void set_slow_device_expander(BlueFSDeviceExpander* a) {
     slow_dev_expander = a;
   }

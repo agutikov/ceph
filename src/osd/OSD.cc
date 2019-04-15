@@ -1460,6 +1460,18 @@ void OSDService::set_epochs(const epoch_t *_boot_epoch, const epoch_t *_up_epoch
   }
 }
 
+void OSDService::send_mark_me_down()
+{
+    monc->send_mon_message(
+      new MOSDMarkMeDown(
+	monc->get_fsid(),
+	whoami,
+	osdmap->get_addrs(whoami),
+	osdmap->get_epoch(),
+	true  // request ack
+	));
+}
+
 bool OSDService::prepare_to_stop()
 {
   std::lock_guard l(is_stopping_lock);
@@ -1470,14 +1482,9 @@ bool OSDService::prepare_to_stop()
   if (osdmap && osdmap->is_up(whoami)) {
     dout(0) << __func__ << " telling mon we are shutting down" << dendl;
     set_state(PREPARING_TO_STOP);
-    monc->send_mon_message(
-      new MOSDMarkMeDown(
-	monc->get_fsid(),
-	whoami,
-	osdmap->get_addrs(whoami),
-	osdmap->get_epoch(),
-	true  // request ack
-	));
+
+    send_mark_me_down();
+
     utime_t now = ceph_clock_now();
     utime_t timeout;
     timeout.set_from_double(now + cct->_conf->osd_mon_shutdown_timeout);
@@ -2543,6 +2550,10 @@ bool OSD::asok_command(std::string_view admin_command, const cmdmap_t& cmdmap,
     f->close_section();
   } else if (admin_command == "flush_journal") {
     store->flush_journal();
+  } else if (admin_command == "dump_bdev_stats") {
+    store->dump_bdev_stats(f);
+  } else if (admin_command == "inject_mark_me_down") {
+    service.send_mark_me_down();
   } else if (admin_command == "dump_ops_in_flight" ||
              admin_command == "ops" ||
              admin_command == "dump_blocked_ops" ||
@@ -3433,6 +3444,15 @@ void OSD::final_init()
                                      asok_hook,
                                      "flush the journal to permanent store");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("dump_bdev_stats", "dump_bdev_stats",
+             asok_hook,
+             "show some bdev perf stats");
+  assert(r == 0);
+  r = admin_socket->register_command("inject_mark_me_down", "inject_mark_me_down",
+             asok_hook,
+             "send mark-me-down msg to mon");
+  assert(r == 0);
+
   r = admin_socket->register_command("dump_ops_in_flight",
 				     "dump_ops_in_flight " \
 				     "name=filterstr,type=CephString,n=N,req=false",
@@ -5234,8 +5254,13 @@ void OSD::handle_osd_ping(MOSDPing *m)
       }
 
       if (!cct->get_heartbeat_map()->is_healthy()) {
-	dout(10) << "internal heartbeat not healthy, dropping ping request" << dendl;
+        dout(0) << "internal heartbeat not healthy, dropping ping request" << dendl;
 	break;
+      }
+
+      if (store != nullptr && !store->is_healthy()) {
+        dout(0) << "internal store not healthy, dropping ping request" << dendl;
+        break;
       }
 
       Message *r = new MOSDPing(monc->get_fsid(),
@@ -5749,10 +5774,15 @@ void OSD::tick_without_osd_lock()
     // mon report?
     utime_t now = ceph_clock_now();
     if (service.need_fullness_update() ||
-	now - last_mon_report > cct->_conf->osd_mon_report_interval) {
+	now - last_mon_report > cct->_conf->osd_mon_report_interval ||
+	!store->is_healthy()) {
       last_mon_report = now;
       send_full_update();
       send_failures();
+      if (!store->is_healthy() && get_osdmap()->is_up(whoami)) {
+        dout(0) << __func__ << " store is unhealthy - send mark_me_down to mon" << dendl;
+        service.send_mark_me_down();
+      }
     }
     map_lock.put_read();
 
@@ -6789,6 +6819,8 @@ COMMAND("dump_pg_recovery_stats", "dump pg recovery statistics",
 	"osd", "r")
 COMMAND("reset_pg_recovery_stats", "reset pg recovery statistics",
 	"osd", "rw")
+COMMAND("dump_bdev_stats", "dump block device stats",
+    "osd", "r")
 COMMAND("compact",
         "compact object store's omap. "
         "WARNING: Compaction probably slows your requests",
@@ -7252,6 +7284,13 @@ int OSD::_do_command(
     vector<string> argvec;
     get_str_vec(arg, argvec);
     cpu_profiler_handle_command(argvec, ds);
+  }
+
+  else if (prefix == "dump_bdev_stats") {
+    if (f) {
+      store->dump_bdev_stats(f.get());
+      f->flush(ds);
+    }
   }
 
   else if (prefix == "dump_pg_recovery_stats") {

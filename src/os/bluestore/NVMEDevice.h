@@ -53,6 +53,8 @@ class NVMEDevice : public BlockDevice {
 
   NVMEDevice(CephContext* cct, aio_callback_t cb, void *cbpriv);
 
+  bool is_healthy() const override { return true; }
+
   bool supported_bdev_label() override { return false; }
 
   void aio_submit(IOContext *ioc) override;
